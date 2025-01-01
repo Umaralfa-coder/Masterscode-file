@@ -1,0 +1,171 @@
+import numpy as np
+import pandas as pd
+from shapely.geometry import Polygon, Point, MultiPoint
+from shapely.ops import triangulate
+import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
+from matplotlib.cm import ScalarMappable
+
+# Safe conversion functions
+def safe_convert_to_float(value):
+    try:
+        return float(value.replace(',', '.')) if isinstance(value, str) else float(value)
+    except (ValueError, TypeError):
+        return np.nan
+
+def convert_to_metres(degrees_list):
+    degrees_list = degrees_list.apply(safe_convert_to_float)
+    min_value = min(degrees_list)
+    meters = (degrees_list - min_value) * (111.32 * 10 ** 3)
+    return meters
+
+# Alpha Shape Calculation
+def alpha_shape(points, alpha):
+    if len(points) < 4:
+        return MultiPoint(points).convex_hull
+
+    edges = set()
+    for triangle in triangulate(MultiPoint(points)):
+        coords = triangle.exterior.coords[:-1]
+        for i in range(len(coords)):
+            for j in range(i + 1, len(coords)):
+                edge = tuple(sorted((coords[i], coords[j])))
+                edges.add(edge)
+    
+    alpha_edges = [
+        edge for edge in edges 
+        if np.linalg.norm(np.array(edge[0]) - np.array(edge[1])) < 1 / alpha
+    ]
+    
+    if len(alpha_edges) == 0:
+        return MultiPoint(points).convex_hull
+    return Polygon([edge[0] for edge in alpha_edges] + [alpha_edges[0][0]])
+
+# Cellular Automata Update
+def cellular_automata_update(grid, iterations=1):
+    for _ in range(iterations):
+        padded_grid = np.pad(grid, pad_width=1, mode='constant', constant_values=np.nan)
+        updated_grid = np.copy(grid)
+
+        for i in range(1, padded_grid.shape[0] - 1):
+            for j in range(1, padded_grid.shape[1] - 1):
+                neighborhood = padded_grid[i - 1:i + 2, j - 1:j + 2]
+                if np.isnan(neighborhood).all():
+                    continue
+                updated_grid[i - 1, j - 1] = np.nanmean(neighborhood)
+
+        grid = updated_grid
+
+    return grid
+
+# Advection-Diffusion Update
+def advection_diffusion_update(grid, u, v, diffusion_coefficient, dt=1.0, iterations=1):
+    dx, dy = 2, 2
+    for _ in range(iterations):
+        padded_grid = np.pad(grid, pad_width=1, mode='constant', constant_values=np.nan)
+        updated_grid = np.copy(grid)
+
+        for i in range(1, padded_grid.shape[0] - 1):
+            for j in range(1, padded_grid.shape[1] - 1):
+                if np.isnan(padded_grid[i, j]):
+                    continue
+
+                advection_term = (
+                    -u * (padded_grid[i, j + 1] - padded_grid[i, j - 1]) / (2 * dx) 
+                    - v * (padded_grid[i + 1, j] - padded_grid[i - 1, j]) / (2 * dy)
+                )
+
+                diffusion_term = (
+                    diffusion_coefficient * (
+                        (padded_grid[i, j + 1] - 2 * padded_grid[i, j] + padded_grid[i, j - 1]) / dx**2 +
+                        (padded_grid[i + 1, j] - 2 * padded_grid[i, j] + padded_grid[i - 1, j]) / dy**2
+                    )
+                )
+
+                updated_grid[i - 1, j - 1] += dt * (advection_term + diffusion_term)
+
+        grid = np.where(np.isnan(updated_grid), grid, updated_grid)
+
+    return grid
+
+# Visualization Function with Alpha Shape
+def visualize_models_with_alpha(points, variable_data, alpha, u=0.1, v=0.1, diffusion_coefficient=0.01, time_steps=[0, 8, 16, 24]):
+    hull_polygon = alpha_shape(points, alpha)
+
+    x_min, y_min, x_max, y_max = hull_polygon.bounds
+    x_coords = np.arange(x_min, x_max, 2)
+    y_coords = np.arange(y_min, y_max, 2)
+    grid_points = np.transpose([np.tile(x_coords, len(y_coords)), np.repeat(y_coords, len(x_coords))])
+
+    grid = np.full((len(y_coords), len(x_coords)), np.nan)
+    for i, (x, y) in enumerate(grid_points):
+        center = Point(x, y)
+        if hull_polygon.contains(center):
+            distances = np.sqrt((points[:, 0] - x) ** 2 + (points[:, 1] - y) ** 2)
+            closest_points = points[distances < 2.5]
+            if len(closest_points) > 0:
+                indices = [np.where((points == point).all(axis=1))[0][0] for point in closest_points]
+                grid[i // len(x_coords), i % len(x_coords)] = variable_data.iloc[indices].mean()
+
+    grids_ca = [np.copy(grid)]
+    grids_ad = [np.copy(grid)]
+
+    for _ in range(1, len(time_steps)):
+        grids_ca.append(cellular_automata_update(np.copy(grids_ca[-1]), iterations=8))
+        grids_ad.append(advection_diffusion_update(np.copy(grids_ad[-1]), u, v, diffusion_coefficient, iterations=8))
+
+    fig, axes = plt.subplots(3, len(time_steps), figsize=(20, 12))
+    fig.subplots_adjust(hspace=0.3)
+
+    for i, t in enumerate(time_steps):
+        ax = axes[0, i]
+        norm = Normalize(vmin=np.nanmin(grids_ca[i]), vmax=np.nanmax(grids_ca[i]))
+        im = ax.imshow(grids_ca[i], origin='lower', cmap='viridis', norm=norm)
+        ax.set_title(f"{t} hours")
+        if i == 0:
+            ax.set_ylabel("Normal CA Model")
+        fig.colorbar(ScalarMappable(norm=norm, cmap='viridis'), ax=ax)
+
+    for i, t in enumerate(time_steps):
+        ax = axes[1, i]
+        diff = grids_ad[i] - grids_ca[i]
+        norm = Normalize(vmin=np.nanmin(diff), vmax=np.nanmax(diff))
+        im = ax.imshow(diff, origin='lower', cmap='coolwarm', norm=norm)
+        if i == 0:
+            ax.set_ylabel("Difference")
+        fig.colorbar(ScalarMappable(norm=norm, cmap='coolwarm'), ax=ax)
+
+    for i, t in enumerate(time_steps):
+        ax = axes[2, i]
+        norm = Normalize(vmin=np.nanmin(grids_ad[i]), vmax=np.nanmax(grids_ad[i]))
+        im = ax.imshow(grids_ad[i], origin='lower', cmap='viridis', norm=norm)
+        if i == 0:
+            ax.set_ylabel("Advection-Diffusion Model")
+        fig.colorbar(ScalarMappable(norm=norm, cmap='viridis'), ax=ax)
+
+    fig.text(0.5, 0.04, "X [km]", ha="center")
+    fig.text(0.04, 0.5, "Y [km]", va="center", rotation="vertical")
+    plt.show()
+
+def ouvrir_fichier(filename):
+    data_frame = pd.read_csv(filename, delimiter=';', encoding='ISO-8859-1')
+    data_frame.iloc[:, 2] = data_frame.iloc[:, 2].map(safe_convert_to_float)
+    data_frame.iloc[:, 3] = data_frame.iloc[:, 3].map(safe_convert_to_float)
+    data_frame = data_frame.dropna(subset=[data_frame.columns[2], data_frame.columns[3]])
+
+    lat_meters = convert_to_metres(data_frame.iloc[:, 2])
+    lon_meters = convert_to_metres(data_frame.iloc[:, 3])
+    points = np.column_stack((lon_meters, lat_meters))
+
+    variable = input('Quelle variable souhaitez-vous modeliser ? (turbidity/oxygene/temperature/ph/redox/conductivite): ')
+    column_map = {'turbidity': 13, 'oxygene': 17, 'temperature': 15, 'ph': 22, 'redox': 23, 'conductivite': 28}
+    variable_column = column_map.get(variable)
+
+    if variable_column is None:
+        raise ValueError("Variable non reconnue.")
+    variable_data = data_frame.iloc[:, variable_column].map(safe_convert_to_float)
+    visualize_models_with_alpha(points, variable_data, alpha=0.01)
+
+# Replace this with the path to your file
+filename = r"/home/bot/Downloads/analyse Treat Heron 221021 (5).csv"
+ouvrir_fichier(filename)

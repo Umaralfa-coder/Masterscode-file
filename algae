@@ -1,0 +1,154 @@
+import numpy as np
+import pandas as pd
+from sklearn.cluster import DBSCAN
+from shapely.geometry import Polygon, Point, MultiPoint
+from shapely.ops import triangulate
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from matplotlib.colors import Normalize
+from matplotlib.path import Path
+from scipy.interpolate import griddata
+import random
+import time
+
+# Safe conversion functions
+def safe_convert_to_float(value):
+    try:
+        return float(value.replace(',', '.')) if isinstance(value, str) else float(value)
+    except (ValueError, TypeError):
+        return np.nan
+
+# Convert coordinates to meters
+def convert_to_metres(degrees_list):
+    degrees_list = degrees_list.apply(safe_convert_to_float)
+    min_value = min(degrees_list)
+    meters = (degrees_list - min_value) * (111.32 * 10 ** 3)
+    return meters
+
+# Simulation of reaction, advection, and diffusion
+def apply_simulation(grid, temp, pH, light, nutrients, oxygen, iterations=10):
+    for _ in range(iterations):
+        padded_grid = np.pad(grid, pad_width=1, mode='constant', constant_values=np.nan)
+        updated_grid = np.copy(grid)
+
+        for i in range(1, padded_grid.shape[0] - 1):
+            for j in range(1, padded_grid.shape[1] - 1):
+                if np.isnan(padded_grid[i, j]):
+                    continue
+
+                # Advection
+                vx, vy = 0.01, 0.01
+                advection = (
+                    -vx * (padded_grid[i, j] - padded_grid[i, j - 1]) -
+                    vy * (padded_grid[i, j] - padded_grid[i - 1, j])
+                )
+
+                # Diffusion
+                diffusion = (
+                    0.00001 * (
+                        (padded_grid[i - 1, j] + padded_grid[i + 1, j] +
+                         padded_grid[i, j - 1] + padded_grid[i, j + 1]) -
+                        4 * padded_grid[i, j]
+                    )
+                )
+
+                # Reaction (growth rate)
+                N = (0.1 * nutrients[i-1, j-1]) / (nutrients[i-1, j-1] + 0.1)
+                L = light[i-1, j-1] / (light[i-1, j-1] + 20)
+                T = np.exp(-((temp[i-1, j-1] - 25) ** 2) / (2 * (5 ** 2)))
+                M = pH[i-1, j-1] / (pH[i-1, j-1] + 0.1)
+                O = oxygen[i-1, j-1] / (oxygen[i-1, j-1] + 0.2)
+                reaction = 0.07 * grid[i-1, j-1] * (1 + N) * L * T * M * O
+
+                # Update grid
+                updated_grid[i - 1, j - 1] += advection + diffusion + reaction
+
+        grid = updated_grid
+
+    return grid
+
+# Main function to process file and run simulation
+def ouvrir_fichier(filename):
+    try:
+        # Load and preprocess data
+        data_frame = pd.read_csv(filename, delimiter=';', encoding='ISO-8859-1')
+        data_frame.iloc[:, 2] = data_frame.iloc[:, 2].map(safe_convert_to_float)
+        data_frame.iloc[:, 3] = data_frame.iloc[:, 3].map(safe_convert_to_float)
+        data_frame = data_frame.dropna(subset=[data_frame.columns[2], data_frame.columns[3]])
+
+        # Convert coordinates to meters
+        lat_meters = convert_to_metres(data_frame.iloc[:, 2])
+        lon_meters = convert_to_metres(data_frame.iloc[:, 3])
+        points = np.column_stack((lon_meters, lat_meters))
+
+        # Apply DBSCAN clustering
+        db = DBSCAN(eps=50, min_samples=5).fit(points)
+        labels = db.labels_
+
+        # Initialize variables
+        variable_columns = {
+            'oxygen': 17,
+            'temperature': 15,
+            'ph': 22
+        }
+
+        oxygen = data_frame.iloc[:, variable_columns['oxygen']].map(safe_convert_to_float).to_numpy()
+        temp = data_frame.iloc[:, variable_columns['temperature']].map(safe_convert_to_float).to_numpy()
+        pH = data_frame.iloc[:, variable_columns['ph']].map(safe_convert_to_float).to_numpy()
+
+        # Process clusters
+        unique_labels = set(labels)
+        for k in sorted(unique_labels):
+            if k == -1:
+                continue
+
+            class_member_mask = (labels == k)
+            cluster_points = points[class_member_mask]
+
+            if len(cluster_points) < 3:
+                continue
+
+            # Create grid
+            x_min, y_min, x_max, y_max = cluster_points[:, 0].min(), cluster_points[:, 1].min(), cluster_points[:, 0].max(), cluster_points[:, 1].max()
+            x_coords = np.arange(x_min, x_max, 2)
+            y_coords = np.arange(y_min, y_max, 2)
+            grid_x, grid_y = np.meshgrid(x_coords, y_coords)
+
+            # Interpolate data to grid
+            temp_grid = griddata(points, temp, (grid_x, grid_y), method='linear', fill_value=np.nan)
+            pH_grid = griddata(points, pH, (grid_x, grid_y), method='linear', fill_value=np.nan)
+            oxygen_grid = griddata(points, oxygen, (grid_x, grid_y), method='linear', fill_value=np.nan)
+
+            light = np.random.uniform(50, 200, size=temp_grid.shape)  # Light intensity
+            nutrients = np.random.uniform(5, 20, size=temp_grid.shape)  # Nutrient concentration
+            grid = np.full(temp_grid.shape, 0.1)  # Initial algae concentration
+
+            # Apply simulation
+            simulated_grid = apply_simulation(grid, temp_grid, pH_grid, light, nutrients, oxygen_grid, iterations=10)
+
+            # 2D Plot
+            plt.figure(figsize=(10, 6))
+            norm = Normalize(vmin=np.nanmin(simulated_grid), vmax=np.nanmax(simulated_grid))
+            plt.imshow(simulated_grid, origin='lower', cmap='viridis', extent=(x_min, x_max, y_min, y_max), norm=norm)
+            plt.colorbar(label='Algae Concentration')
+            plt.title(f'Algae Concentration Distribution in Cluster {k}')
+            plt.xlabel('Longitude (meters)')
+            plt.ylabel('Latitude (meters)')
+            plt.show()
+
+            # 3D Plot
+            fig = plt.figure(figsize=(12, 8))
+            ax = fig.add_subplot(111, projection='3d')
+            ax.plot_surface(grid_x, grid_y, simulated_grid, cmap='viridis', rstride=1, cstride=1, linewidth=0, antialiased=True)
+            ax.set_title(f'3D Algae Concentration Distribution in Cluster {k}')
+            ax.set_xlabel('Longitude (meters)')
+            ax.set_ylabel('Latitude (meters)')
+            ax.set_zlabel('Algae Concentration')
+            plt.show()
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+# Replace this with the path to your file
+filename = r"/home/bot/Downloads/analyse Treat Heron 221021 (5).csv"
+ouvrir_fichier(filename)

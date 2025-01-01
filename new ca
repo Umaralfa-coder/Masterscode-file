@@ -1,0 +1,187 @@
+import numpy as np
+import pandas as pd
+from sklearn.cluster import DBSCAN
+from shapely.geometry import Polygon, Point, MultiPoint
+from shapely.ops import triangulate
+import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
+from matplotlib.cm import ScalarMappable
+from matplotlib.patches import Rectangle
+
+# Safe conversion functions
+def safe_convert_to_float(value):
+    try:
+        return float(value.replace(',', '.')) if isinstance(value, str) else float(value)
+    except (ValueError, TypeError):
+        return np.nan
+
+# Convert coordinates to meters
+def convert_to_metres(degrees_list):
+    degrees_list = degrees_list.apply(safe_convert_to_float)
+    min_value = min(degrees_list)
+    meters = (degrees_list - min_value) * (111.32 * 10 ** 3)
+    return meters
+
+# Generate alpha shape for concave hull
+def alpha_shape(points, alpha):
+    if len(points) < 4:
+        return MultiPoint(points).convex_hull
+
+    edges = set()
+    for triangle in triangulate(MultiPoint(points)):
+        coords = triangle.exterior.coords[:-1]  # Remove closing point
+        for i in range(len(coords)):
+            for j in range(i + 1, len(coords)):
+                edge = tuple(sorted((coords[i], coords[j])))
+                edges.add(edge)
+    
+    alpha_edges = [
+        edge for edge in edges 
+        if np.linalg.norm(np.array(edge[0]) - np.array(edge[1])) < 1 / alpha
+    ]
+    
+    if len(alpha_edges) == 0:
+        return MultiPoint(points).convex_hull
+    return Polygon([edge[0] for edge in alpha_edges] + [alpha_edges[0][0]])
+
+# Reaction, advection, and diffusion simulation
+def apply_reaction_advection_diffusion(grid, temp, oxygen, pH, nutrients, params, iterations=1):
+    dx, dy = 2, 2  # Grid spacing
+    dt = 1.0       # Time step
+
+    for _ in range(iterations):
+        padded_grid = np.pad(grid, pad_width=1, mode='constant', constant_values=np.nan)
+        updated_grid = np.copy(grid)
+
+        for i in range(1, padded_grid.shape[0] - 1):
+            for j in range(1, padded_grid.shape[1] - 1):
+                if np.isnan(padded_grid[i, j]):
+                    continue
+
+                # Advection
+                u, v = params['u'], params['v']
+                advection_term = (
+                    -u * (padded_grid[i, j + 1] - padded_grid[i, j - 1]) / (2 * dx) 
+                    - v * (padded_grid[i + 1, j] - padded_grid[i - 1, j]) / (2 * dy)
+                )
+
+                # Diffusion
+                diffusion_term = (
+                    params['diffusion_coefficient'] * (
+                        (padded_grid[i, j + 1] - 2 * padded_grid[i, j] + padded_grid[i, j - 1]) / dx**2 +
+                        (padded_grid[i + 1, j] - 2 * padded_grid[i, j] + padded_grid[i - 1, j]) / dy**2
+                    )
+                )
+
+                # Reaction (e.g., algae growth, oxygen production/consumption)
+                reaction_term = (
+                    params['reaction_rate'] * 
+                    (oxygen[i-1, j-1] * nutrients[i-1, j-1] - temp[i-1, j-1] * pH[i-1, j-1])
+                )
+
+                # Update grid
+                updated_grid[i - 1, j - 1] += dt * (advection_term + diffusion_term + reaction_term)
+
+        grid = updated_grid
+
+    return grid
+
+# Main function to process file and run simulation
+def ouvrir_fichier(filename):
+    try:
+        # Load and preprocess data
+        data_frame = pd.read_csv(filename, delimiter=';', encoding='ISO-8859-1')
+        data_frame.iloc[:, 2] = data_frame.iloc[:, 2].map(safe_convert_to_float)
+        data_frame.iloc[:, 3] = data_frame.iloc[:, 3].map(safe_convert_to_float)
+        data_frame = data_frame.dropna(subset=[data_frame.columns[2], data_frame.columns[3]])
+
+        # Convert coordinates to meters
+        lat_meters = convert_to_metres(data_frame.iloc[:, 2])
+        lon_meters = convert_to_metres(data_frame.iloc[:, 3])
+        points = np.column_stack((lon_meters, lat_meters))
+
+        # Apply DBSCAN clustering
+        db = DBSCAN(eps=50, min_samples=5).fit(points)
+        labels = db.labels_
+
+        # Select variable to model
+        variable = input('Quelle variable souhaitez-vous modeliser ? (turbidity/oxygene/temperature/ph/redox/conductivite): ')
+        column_map = {
+            'turbidity': 13,
+            'oxygene': 17,
+            'temperature': 15,
+            'ph': 22,
+            'redox': 23,
+            'conductivite': 28
+        }
+
+        if variable not in column_map:
+            raise ValueError('Variable non reconnue')
+
+        variable_column = column_map[variable]
+        data_frame[variable] = data_frame.iloc[:, variable_column].map(safe_convert_to_float)
+
+        # Process clusters
+        unique_labels = set(labels)
+        for k in unique_labels:
+            if k == -1:
+                continue
+
+            class_member_mask = (labels == k)
+            cluster_points = points[class_member_mask]
+            cluster_variable_data = data_frame.iloc[class_member_mask][variable]
+
+            if len(cluster_points) < 3:
+                continue
+
+            # Generate alpha shape for the cluster
+            alpha = 0.01
+            hull_polygon = alpha_shape(cluster_points, alpha)
+
+            # Create grid
+            x_min, y_min, x_max, y_max = hull_polygon.bounds
+            x_coords = np.arange(x_min, x_max, 2)
+            y_coords = np.arange(y_min, y_max, 2)
+            grid_points = np.transpose([np.tile(x_coords, len(y_coords)), np.repeat(y_coords, len(x_coords))])
+
+            grid = np.full((len(y_coords), len(x_coords)), np.nan)
+
+            # Map field data to grid
+            for i, (x, y) in enumerate(grid_points):
+                center = Point(x, y)
+                if hull_polygon.contains(center):
+                    distances = np.sqrt((cluster_points[:, 0] - x) ** 2 + (cluster_points[:, 1] - y) ** 2)
+                    closest_points = cluster_points[distances < 2.5]
+                    if len(closest_points) > 0:
+                        indices = [np.where((cluster_points == point).all(axis=1))[0][0] for point in closest_points]
+                        grid[i // len(x_coords), i % len(x_coords)] = cluster_variable_data.iloc[indices].mean()
+
+            # Initialize simulation parameters
+            params = {
+                'u': 0.1,
+                'v': 0.1,
+                'diffusion_coefficient': 0.01,
+                'reaction_rate': 0.05
+            }
+
+            # Apply simulation
+            simulated_grid = apply_reaction_advection_diffusion(
+                grid, grid, grid, grid, grid, params, iterations=10
+            )
+
+            # Plot results
+            plt.figure(figsize=(8, 6))
+            norm = Normalize(vmin=np.nanmin(simulated_grid), vmax=np.nanmax(simulated_grid))
+            plt.imshow(simulated_grid, origin='lower', cmap='viridis', norm=norm)
+            plt.colorbar(label=f'{variable.capitalize()} Concentration')
+            plt.title(f'Simulation for Cluster {k}')
+            plt.xlabel('Longitude (meters)')
+            plt.ylabel('Latitude (meters)')
+            plt.show()
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+# Replace this with the path to your file
+filename = r"/home/bot/Downloads/analyse Treat Heron 221021 (5).csv"
+ouvrir_fichier(filename)
